@@ -1,0 +1,403 @@
+# PRODUCTION stack. Works on x86 (AWS) and ARM64 (Oracle Cloud): every image here exists
+# for both, and our own images are built on the server itself. Step by step: docs/DEPLOY.md.
+#
+#   docker compose -f compose.prod.yaml up -d --build
+#
+# Differences from compose.yaml (development):
+#   - only nginx is reachable from outside (ports 80 and 443); databases, Kafka, Redis,
+#     Config Server, Eureka and the services have no published ports at all
+#   - nginx serves the frontend and the API on the same origin, with HTTPS (Let's Encrypt)
+#   - refresh-token cookie Secure, real SMTP server from .env, no Mailpit, no kafka-ui,
+#     Swagger switched off, no dev JVM flag, restart unless stopped, log rotation
+#   - production values that differ from the config repo are set here as environment
+#     variables (they win over the Config Server); the config repo itself is the same
+#
+# Secrets and settings come from .env next to this file (template: .env.example).
+
+name: ecommerce-prod
+
+# ---- Shared pieces, reused below with "<<: *name" ----------------------------------------
+
+# Docker keeps container logs in files that grow forever by default: keep 3 x 10 MB each
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# Environment every Spring service needs: Config Server and Eureka logins, Kafka, JVM memory
+x-spring-env: &spring-env
+  CONFIG_USERNAME: ${CONFIG_USERNAME}
+  CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+  CONFIG_SERVER_URL: http://config-server:8888
+  EUREKA_USERNAME: ${EUREKA_USERNAME}
+  EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME}:${EUREKA_PASSWORD}@eureka:8761/eureka/
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  JWT_SECRET: ${JWT_SECRET}
+  # Use up to 75% of the container's memory limit for the Java heap
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+  # No OpenAPI spec in production (Swagger is a development tool)
+  SPRINGDOC_API_DOCS_ENABLED: "false"
+
+# The business services start only when their infrastructure is healthy
+x-depends-on-core: &depends-on-core
+  kafka:
+    condition: service_healthy
+  config-server:
+    condition: service_healthy
+  eureka:
+    condition: service_healthy
+
+services:
+
+  # ---- Databases, Kafka, Redis (internal only: no "ports") --------------------------------
+
+  mysql:
+    image: mysql:8.4
+    <<: *logging
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      USER_DB_PASSWORD: ${USER_DB_PASSWORD}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres:
+    image: postgres:17
+    <<: *logging
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  mongo:
+    image: mongo:8.0
+    <<: *logging
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+      PRODUCT_DB_PASSWORD: ${PRODUCT_DB_PASSWORD}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD}
+    volumes:
+      - mongo-data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
+    mem_limit: 512m
+    healthcheck:
+      # A port check, not mongosh: mongosh starts a Node.js program every 10 s, which on a busy
+      # machine took over a minute and made mongo flap to unhealthy (same reason as kafka).
+      # $(hostname), not 127.0.0.1: on the first start the init scripts run on a temporary
+      # server that listens only on 127.0.0.1, so this check waits for the real server.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/$$(hostname)/27017"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  kafka:
+    image: apache/kafka:4.3.1
+    <<: *logging
+    environment:
+      # Only the Docker-network listener (no "localhost:9092" door as in development)
+      KAFKA_LISTENERS: DOCKER://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: DOCKER://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single-node KRaft setup
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    restart: unless-stopped
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 29092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Only holds the gateway's rate-limit counters, so nothing is saved to disk
+  redis:
+    image: redis:7-alpine
+    <<: *logging
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --save '' --appendonly no --maxmemory 48mb --maxmemory-policy allkeys-lru"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    restart: unless-stopped
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Spring Cloud infrastructure -------------------------------------------------------
+
+  config-server:
+    build: ./Config_Server
+    <<: *logging
+    environment:
+      CONFIG_USERNAME: ${CONFIG_USERNAME}
+      CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+      CONFIG_GIT_URI: ${CONFIG_GIT_URI}
+      CONFIG_GIT_USERNAME: ${CONFIG_GIT_USERNAME}
+      CONFIG_GIT_SEARCH_PATHS: ${CONFIG_GIT_SEARCH_PATHS:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  eureka:
+    build: ./Eureka_Server
+    <<: *logging
+    environment:
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8761/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  api-gateway:
+    build: ./Api_Gateway
+    <<: *logging
+    environment:
+      <<: *spring-env
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # Behind nginx: take the client's IP (X-Forwarded-For, set by nginx) and the original
+      # https://DOMAIN address from the forwarded headers, so the per-IP rate limit works
+      SERVER_FORWARD_HEADERS_STRATEGY: native
+      # Same origin, so CORS is not needed; allow only the site itself, just in case
+      APP_CORS_ALLOWED_ORIGINS: https://${DOMAIN}
+      SPRINGDOC_SWAGGER_UI_ENABLED: "false"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ---- Business services -----------------------------------------------------------------
+
+  user-service:
+    build: ./User_Service
+    <<: *logging
+    environment:
+      <<: *spring-env
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/userdb
+      SPRING_DATASOURCE_USERNAME: user_svc
+      SPRING_DATASOURCE_PASSWORD: ${USER_DB_PASSWORD}
+      # The site is HTTPS: the refresh-token cookie is only ever sent over HTTPS
+      APP_AUTH_REFRESH_COOKIE_SECURE: "true"
+      # First admin, created at startup only while no admin exists (empty = off)
+      APP_ADMIN_EMAIL: ${ADMIN_EMAIL}
+      APP_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    depends_on:
+      <<: *depends-on-core
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  product-service:
+    build: ./Product_Service
+    <<: *logging
+    environment:
+      <<: *spring-env
+      SPRING_MONGODB_URI: mongodb://product_svc:${PRODUCT_DB_PASSWORD}@mongo:27017/productdb?authSource=productdb
+    depends_on:
+      <<: *depends-on-core
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  order-service:
+    build: ./Order_Service
+    <<: *logging
+    environment:
+      <<: *spring-env
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/order_db
+      SPRING_DATASOURCE_USERNAME: order_svc
+      SPRING_DATASOURCE_PASSWORD: ${ORDER_DB_PASSWORD}
+    depends_on:
+      <<: *depends-on-core
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  payment-service:
+    build: ./Payment_Service
+    <<: *logging
+    environment:
+      <<: *spring-env
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payment_db
+      SPRING_DATASOURCE_USERNAME: payment_svc
+      SPRING_DATASOURCE_PASSWORD: ${PAYMENT_DB_PASSWORD}
+    depends_on:
+      <<: *depends-on-core
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8084/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  notification-service:
+    build: ./Notification_Service
+    <<: *logging
+    environment:
+      <<: *spring-env
+      SPRING_MONGODB_URI: mongodb://notification_svc:${NOTIFICATION_DB_PASSWORD}@mongo:27017/notificationdb?authSource=notificationdb
+      # A real SMTP server (from your mail provider), all from .env
+      SPRING_MAIL_HOST: ${MAIL_HOST}
+      SPRING_MAIL_PORT: ${MAIL_PORT}
+      SPRING_MAIL_USERNAME: ${MAIL_USERNAME}
+      SPRING_MAIL_PASSWORD: ${MAIL_PASSWORD}
+      APP_MAIL_FROM: ${MAIL_FROM}
+      # Log in to the SMTP server and encrypt with STARTTLS (what port 587 expects)
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH: ${MAIL_SMTP_AUTH:-true}
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE: ${MAIL_SMTP_STARTTLS:-true}
+      # No SMTP login in every health check (every 15 s): a mail provider outage would mark the
+      # service unhealthy although it keeps working, and providers may block such traffic.
+      # Emails are retried by EmailSenderJob anyway; failures show in the log.
+      MANAGEMENT_HEALTH_MAIL_ENABLED: "false"
+    depends_on:
+      <<: *depends-on-core
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ---- The only public container ---------------------------------------------------------
+
+  # Serves the frontend and forwards the API paths to api-gateway, on one origin.
+  # HTTP only until a Let's Encrypt certificate exists, then HTTPS (see nginx/ and DEPLOY.md).
+  nginx:
+    build:
+      context: .
+      dockerfile: nginx/Dockerfile
+    <<: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - certbot-certs:/etc/letsencrypt:ro
+      - certbot-www:/var/www/certbot:ro
+    # service_started, not service_healthy: nginx finds the gateway when a request comes in
+    # (resolver in nginx/snippets/app.conf), so it can start first. Until the gateway is
+    # ready, the pages load and API calls get a short 502.
+    depends_on:
+      api-gateway:
+        condition: service_started
+    restart: unless-stopped
+    mem_limit: 64m
+
+  # Gets and renews the HTTPS certificate. Not started with the stack ("profiles"): run it
+  # by hand, see docs/DEPLOY.md, step "HTTPS".
+  certbot:
+    image: certbot/certbot:v5.9.0
+    profiles: ["certbot"]
+    volumes:
+      - certbot-certs:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+
+volumes:
+  mysql-data:
+  postgres-data:
+  mongo-data:
+  kafka-data:
+  certbot-certs:
+  certbot-www:

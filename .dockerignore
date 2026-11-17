@@ -1,0 +1,8 @@
+# Only for builds that use the repository root as context (nginx/Dockerfile in
+# compose.prod.yaml). Send nothing except the frontend and the nginx files.
+# (Each service has its own .dockerignore for its own folder.)
+*
+!frontend/
+!nginx/
+frontend/.vscode/
+frontend/README.md

@@ -1,0 +1,19 @@
+# HTTP-only mode: used until a Let's Encrypt certificate exists for ${DOMAIN}
+# (15-choose-config.sh picks this file or https.conf.template at container start).
+# ${DOMAIN} is filled in from the environment when nginx starts; nginx's own variables
+# such as $host are left alone.
+
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    server_tokens off;
+
+    include /etc/nginx/snippets/security-headers.conf;
+
+    # Let's Encrypt checks that we own the domain by fetching a file from here
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    include /etc/nginx/snippets/app.conf;
+}

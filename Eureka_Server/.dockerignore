@@ -1,0 +1,10 @@
+target/
+.git
+.settings/
+.classpath
+.project
+.mvn/
+mvnw
+mvnw.cmd
+*.md
+.env

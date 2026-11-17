@@ -1,0 +1,421 @@
+name: ecommerce
+
+services:
+  mysql:
+    image: mysql:8.4
+    ports:
+      - "127.0.0.1:3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      USER_DB_PASSWORD: ${USER_DB_PASSWORD}
+      ORDER_DB_PASSWORD: ${ORDER_DB_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10 
+      start_period: 30s
+
+  postgres:
+    image: postgres:17
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  mongo:
+    image: mongo:8.0   
+    ports:
+      - "127.0.0.1:27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+      PRODUCT_DB_PASSWORD: ${PRODUCT_DB_PASSWORD}
+      NOTIFICATION_DB_PASSWORD: ${NOTIFICATION_DB_PASSWORD}
+    volumes:
+      - mongo-data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro
+    mem_limit: 512m
+    healthcheck:
+      # A port check, not mongosh: mongosh starts a Node.js program every 10 s, which on a busy
+      # machine took over a minute and made mongo flap to unhealthy (same reason as kafka).
+      # $(hostname), not 127.0.0.1: on the first start the init scripts run on a temporary
+      # server that listens only on 127.0.0.1, so this check waits for the real server.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/$$(hostname)/27017"]
+      interval: 10s
+      timeout: 5s
+      retries: 10 
+      start_period: 60s
+  
+  kafka:
+    image: apache/kafka:4.3.1
+    ports:
+      - "127.0.0.1:9092:9092"
+    environment:
+      # The 3 doors
+      KAFKA_LISTENERS: HOST://:9092,DOCKER://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:9092,DOCKER://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: HOST:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Single-node KRaft setup
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Memory cap
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    mem_limit: 768m
+    healthcheck:
+      # A port check, not kafka-broker-api-versions.sh: that started a whole JVM every 15s,
+      # which on a memory-starved Docker VM itself timed out and made kafka flap to unhealthy
+      test: ["CMD-SHELL", "nc -z localhost 9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Only holds the gateway's rate-limit counters, so nothing is saved to disk
+  redis:
+    image: redis:7-alpine
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --save '' --appendonly no --maxmemory 48mb --maxmemory-policy allkeys-lru"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    mem_limit: 64m
+    healthcheck:
+      # REDISCLI_AUTH keeps the password off the redis-cli command line
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Dev mail server: catches every email Notification sends. Web UI on http://localhost:8025.
+  # SMTP on localhost:1025 too, so a Notification run from Eclipse can send mail (both localhost only)
+  mailpit:
+    image: axllent/mailpit:v1.33.1
+    ports:
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  config-server:
+    build: ./Config_Server
+    ports:
+      - "127.0.0.1:8888:8888"
+    environment:
+      CONFIG_USERNAME: ${CONFIG_USERNAME}
+      CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+      CONFIG_GIT_URI: ${CONFIG_GIT_URI}
+      CONFIG_GIT_USERNAME: ${CONFIG_GIT_USERNAME}
+      CONFIG_GIT_SEARCH_PATHS: ${CONFIG_GIT_SEARCH_PATHS:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN}
+      # TieredStopAtLevel=1 (faster startup): dev only, remove for production
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:TieredStopAtLevel=1"
+    # Spring needs more than the default 10s to shut down cleanly under load
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  eureka:
+    build: ./Eureka_Server
+    ports:
+      - "127.0.0.1:8761:8761"
+    environment:
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+      # TieredStopAtLevel=1 (faster startup): dev only, remove for production
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:TieredStopAtLevel=1"
+    # Spring needs more than the default 10s to shut down cleanly under load
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8761/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s           
+
+  user-service:
+    build: ./User_Service
+    ports:
+      - "127.0.0.1:8082:8082"
+    environment:
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+      CONFIG_USERNAME: ${CONFIG_USERNAME}
+      CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME}:${EUREKA_PASSWORD}@eureka:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/userdb?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: user_svc
+      SPRING_DATASOURCE_PASSWORD: ${USER_DB_PASSWORD}
+      # User publishes UserRegistered events (user-events)
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      JWT_SECRET: ${JWT_SECRET}
+      # First admin, created at startup only while no admin exists (empty = off)
+      APP_ADMIN_EMAIL: ${ADMIN_EMAIL}
+      APP_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      # TieredStopAtLevel=1 (faster startup): dev only, remove for production
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:TieredStopAtLevel=1"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_healthy
+    restart: on-failure
+    # Spring needs more than the default 10s to shut down cleanly under load
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  api-gateway:
+    build: ./Api_Gateway
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+      CONFIG_USERNAME: ${CONFIG_USERNAME}
+      CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME}:${EUREKA_PASSWORD}@eureka:8761/eureka/
+      JWT_SECRET: ${JWT_SECRET}
+      # Redis for the RequestRateLimiter filter
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # TieredStopAtLevel=1 (faster startup): dev only, remove for production
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:TieredStopAtLevel=1"
+    depends_on:
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: on-failure
+    # Spring needs more than the default 10s to shut down cleanly under load
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  product-service:
+    build: ./Product_Service
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+      CONFIG_USERNAME: ${CONFIG_USERNAME}
+      CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME}:${EUREKA_PASSWORD}@eureka:8761/eureka/
+      SPRING_MONGODB_URI: mongodb://product_svc:${PRODUCT_DB_PASSWORD}@mongo:27017/productdb?authSource=productdb
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      JWT_SECRET: ${JWT_SECRET}
+      # TieredStopAtLevel=1 (faster startup): dev only, remove for production
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:TieredStopAtLevel=1"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy  
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_healthy
+    restart: on-failure
+    # Spring needs more than the default 10s to shut down cleanly under load
+    stop_grace_period: 30s
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  order-service:
+    build: ./Order_Service
+    ports:
+      - "127.0.0.1:8083:8083"
+    environment:
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+      CONFIG_USERNAME: ${CONFIG_USERNAME}
+      CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME}:${EUREKA_PASSWORD}@eureka:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/order_db?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: order_svc
+      SPRING_DATASOURCE_PASSWORD: ${ORDER_DB_PASSWORD}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      JWT_SECRET: ${JWT_SECRET}
+      # TieredStopAtLevel=1 (faster startup): dev only, remove for production
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:TieredStopAtLevel=1"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_healthy
+    restart: on-failure
+    # Spring needs more than the default 10s to shut down cleanly under load
+    stop_grace_period: 30s
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  payment-service:
+    build: ./Payment_Service
+    ports:
+      - "127.0.0.1:8084:8084"
+    environment:
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+      CONFIG_USERNAME: ${CONFIG_USERNAME}
+      CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME}:${EUREKA_PASSWORD}@eureka:8761/eureka/
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payment_db
+      SPRING_DATASOURCE_USERNAME: payment_svc
+      SPRING_DATASOURCE_PASSWORD: ${PAYMENT_DB_PASSWORD}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      JWT_SECRET: ${JWT_SECRET}
+      # TieredStopAtLevel=1 (faster startup): dev only, remove for production
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:TieredStopAtLevel=1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_healthy
+    restart: on-failure 
+    # Spring needs more than the default 10s to shut down cleanly under load
+    stop_grace_period: 30s
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8084/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s   
+
+  notification-service:
+    build: ./Notification_Service
+    ports:
+      - "127.0.0.1:8085:8085"
+    environment:
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+      CONFIG_USERNAME: ${CONFIG_USERNAME}
+      CONFIG_PASSWORD: ${CONFIG_PASSWORD}
+      CONFIG_SERVER_URL: http://config-server:8888
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME}:${EUREKA_PASSWORD}@eureka:8761/eureka/
+      SPRING_MONGODB_URI: mongodb://notification_svc:${NOTIFICATION_DB_PASSWORD}@mongo:27017/notificationdb?authSource=notificationdb
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # SMTP settings from .env (Mailpit in dev: host mailpit, port 1025, no username or password)
+      SPRING_MAIL_HOST: ${MAIL_HOST}
+      SPRING_MAIL_PORT: ${MAIL_PORT}
+      SPRING_MAIL_USERNAME: ${MAIL_USERNAME}
+      SPRING_MAIL_PASSWORD: ${MAIL_PASSWORD}
+      APP_MAIL_FROM: ${MAIL_FROM}
+      JWT_SECRET: ${JWT_SECRET}
+      # TieredStopAtLevel=1 (faster startup): dev only, remove for production
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:TieredStopAtLevel=1"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      config-server:
+        condition: service_healthy
+      eureka:
+        condition: service_healthy
+    restart: on-failure
+    # Spring needs more than the default 10s to shut down cleanly under load
+    stop_grace_period: 30s
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/actuator/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.5.0
+    profiles: ["tools"]
+    ports:
+      - "127.0.0.1:8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    mem_limit: 384m    
+
+volumes:
+  mysql-data:
+  postgres-data:
+  mongo-data:
+  kafka-data:

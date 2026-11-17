@@ -1,0 +1,57 @@
+# CI: builds and tests every service on each push and pull request. No deploy step yet.
+#
+# One job per service (the "matrix" below), all running at the same time on GitHub's
+# Ubuntu machines. Each job runs exactly what you run locally: ./mvnw -B verify in the
+# service folder = compile + unit tests + Testcontainers integration tests (the Ubuntu
+# runners have Docker) + package the jar. The practice projects in this repo are not built.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# The workflow only needs to read the code
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the run that is still going for the older one
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # one failing service does not cancel the others, so every result is visible
+      fail-fast: false
+      matrix:
+        service:
+          - Config_Server
+          - Eureka_Server
+          - Api_Gateway
+          - Product_Service
+          - User_Service
+          - Order_Service
+          - Payment_Service
+          - Notification_Service
+    defaults:
+      run:
+        working-directory: ${{ matrix.service }}
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+
+      - name: Set up Java 21 (with a cache of Maven downloads)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: ${{ matrix.service }}/pom.xml
+
+      - name: Build and test
+        run: ./mvnw -B verify
